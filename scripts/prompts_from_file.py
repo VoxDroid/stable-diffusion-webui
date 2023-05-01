@@ -3,13 +3,13 @@ import math
 import os
 import random
 import sys
-import traceback
+import modules.shared as shared
 import shlex
 
 import modules.scripts as scripts
 import gradio as gr
 
-from modules import sd_samplers
+from modules import sd_samplers, errors
 from modules.processing import Processed, process_images
 from PIL import Image
 from modules.shared import opts, cmd_opts, state
@@ -116,7 +116,7 @@ class Script(scripts.Script):
         checkbox_iterate_batch = gr.Checkbox(label="Use same random seed for all lines", value=False, elem_id=self.elem_id("checkbox_iterate_batch"))
 
         prompt_txt = gr.Textbox(label="List of prompt inputs", lines=1, elem_id=self.elem_id("prompt_txt"))
-        file = gr.File(label="Upload prompt inputs", type='bytes', elem_id=self.elem_id("file"))
+        file = gr.File(label="Upload prompt inputs", type='binary', elem_id=self.elem_id("file"))
 
         file.change(fn=load_prompt_file, inputs=[file], outputs=[file, prompt_txt, prompt_txt])
 
@@ -139,18 +139,13 @@ class Script(scripts.Script):
             if "--" in line:
                 try:
                     args = cmdargs(line)
-                except Exception:
-                    print(f"Error parsing line {line} as commandline:", file=sys.stderr)
-                    print(traceback.format_exc(), file=sys.stderr)
+                except Exception as e:
+                    errors.display(e, f'parsing prompts: {line}')
                     args = {"prompt": line}
             else:
                 args = {"prompt": line}
 
-            n_iter = args.get("n_iter", 1)
-            if n_iter != 1:
-                job_count += n_iter
-            else:
-                job_count += 1
+            job_count += args.get("n_iter", p.n_iter)
 
             jobs.append(args)
 
