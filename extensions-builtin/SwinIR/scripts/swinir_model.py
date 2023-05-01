@@ -1,14 +1,13 @@
-import contextlib
 import os
-
 import numpy as np
 import torch
 from PIL import Image
 from basicsr.utils.download_util import load_file_from_url
 from tqdm import tqdm
+from rich import print, progress # pylint: disable=redefined-builtin
 
 from modules import modelloader, devices, script_callbacks, shared
-from modules.shared import cmd_opts, opts
+from modules.shared import cmd_opts, opts, state
 from swinir_model_arch import SwinIR as net
 from swinir_model_arch_v2 import Swin2SR as net2
 from modules.upscaler import Upscaler, UpscalerData
@@ -59,17 +58,17 @@ class UpscalerSwinIR(Upscaler):
             return None
         if filename.endswith(".v2.pth"):
             model = net2(
-            upscale=scale,
-            in_chans=3,
-            img_size=64,
-            window_size=8,
-            img_range=1.0,
-            depths=[6, 6, 6, 6, 6, 6],
-            embed_dim=180,
-            num_heads=[6, 6, 6, 6, 6, 6],
-            mlp_ratio=2,
-            upsampler="nearest+conv",
-            resi_connection="1conv",
+                upscale=scale,
+                in_chans=3,
+                img_size=64,
+                window_size=8,
+                img_range=1.0,
+                depths=[6, 6, 6, 6, 6, 6],
+                embed_dim=180,
+                num_heads=[6, 6, 6, 6, 6, 6],
+                mlp_ratio=2,
+                upsampler="nearest+conv",
+                resi_connection="1conv",
             )
             params = None
         else:
@@ -88,8 +87,9 @@ class UpscalerSwinIR(Upscaler):
             )
             params = "params_ema"
 
-        pretrained_model = torch.load(filename)
-        if params is not None:
+        with progress.open(filename, 'rb', description=f'Loading weights: [cyan]{filename}', auto_refresh=True) as f:
+            pretrained_model = torch.load(filename)
+        if params is not None and params in pretrained_model:
             model.load_state_dict(pretrained_model[params], strict=True)
         else:
             model.load_state_dict(pretrained_model, strict=True)
@@ -145,7 +145,13 @@ def inference(img, model, tile, tile_overlap, window_size, scale):
 
     with tqdm(total=len(h_idx_list) * len(w_idx_list), desc="SwinIR tiles") as pbar:
         for h_idx in h_idx_list:
+            if state.interrupted or state.skipped:
+                break
+
             for w_idx in w_idx_list:
+                if state.interrupted or state.skipped:
+                    break
+                
                 in_patch = img[..., h_idx: h_idx + tile, w_idx: w_idx + tile]
                 out_patch = model(in_patch)
                 out_patch_mask = torch.ones_like(out_patch)

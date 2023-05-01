@@ -2,7 +2,9 @@
 
 let lastHeadImg = null;
 
-notificationButton = null
+let notificationButton = null;
+
+const regExpTempImage = /(?<=\/|\\)tmp[\w\d]{8}\.png$/gm;
 
 onUiUpdate(function(){
     if(notificationButton == null){
@@ -15,13 +17,15 @@ onUiUpdate(function(){
         }
     }
 
-    const galleryPreviews = gradioApp().querySelectorAll('div[id^="tab_"][style*="display: block"] img.h-full.w-full.overflow-hidden');
+    const galleryPreviews = gradioApp().querySelectorAll('div[id^="tab_"][style*="display: block"] div[id$="_results"] .thumbnail-item > img');
 
     if (galleryPreviews == null) return;
 
     const headImg = galleryPreviews[0]?.src;
 
     if (headImg == null || headImg == lastHeadImg) return;
+
+    if (headImg.search(regExpTempImage) != -1) return;
 
     lastHeadImg = headImg;
 
