@@ -1,29 +1,36 @@
 import base64
 import io
-import math
 import os
 import re
-from pathlib import Path
 
-import gradio as gr
-from modules.shared import script_path
-from modules import shared, ui_tempdir, script_callbacks
-import tempfile
 from PIL import Image
+import gradio as gr
+from modules.paths import data_path
+from modules import shared, ui_tempdir, script_callbacks
 
-re_param_code = r'\s*([\w ]+):\s*("(?:\\|\"|[^\"])+"|[^,]*)(?:,|$)'
+re_param_code = r'\s*([\w ]+):\s*("(?:\\"[^,]|\\"|\\|[^\"])+"|[^,]*)(?:,|$)'
 re_param = re.compile(re_param_code)
-re_params = re.compile(r"^(?:" + re_param_code + "){3,}$")
 re_imagesize = re.compile(r"^(\d+)x(\d+)$")
-re_hypernet_hash = re.compile("\(([0-9a-f]+)\)$")
+re_hypernet_hash = re.compile("\(([0-9a-f]+)\)$") # pylint: disable=anomalous-backslash-in-string
 type_of_gr_update = type(gr.update())
+
 paste_fields = {}
-bind_list = []
+registered_param_bindings = []
+
+
+class ParamBinding:
+    def __init__(self, paste_button, tabname, source_text_component=None, source_image_component=None, source_tabname=None, override_settings_component=None, paste_field_names=[]):
+        self.paste_button = paste_button
+        self.tabname = tabname
+        self.source_text_component = source_text_component
+        self.source_image_component = source_image_component
+        self.source_tabname = source_tabname
+        self.override_settings_component = override_settings_component
+        self.paste_field_names = paste_field_names
 
 
 def reset():
     paste_fields.clear()
-    bind_list.clear()
 
 
 def quote(text):
@@ -37,15 +44,19 @@ def quote(text):
 
 
 def image_from_url_text(filedata):
+    if filedata is None:
+        return None
+
     if type(filedata) == list and len(filedata) > 0 and type(filedata[0]) == dict and filedata[0].get("is_file", False):
         filedata = filedata[0]
 
     if type(filedata) == dict and filedata.get("is_file", False):
         filename = filedata["name"]
         is_in_right_dir = ui_tempdir.check_tmp_file(shared.demo, filename)
-        assert is_in_right_dir, 'trying to open image file outside of allowed directories'
-
-        return Image.open(filename)
+        if is_in_right_dir:
+            return Image.open(filename)
+        else:
+            print(f'Attempted to open file outside of allowed directories: {filename}')
 
     if type(filedata) == list:
         if len(filedata) == 0:
@@ -61,8 +72,8 @@ def image_from_url_text(filedata):
     return image
 
 
-def add_paste_fields(tabname, init_img, fields):
-    paste_fields[tabname] = {"init_img": init_img, "fields": fields}
+def add_paste_fields(tabname, init_img, fields, override_settings_component=None):
+    paste_fields[tabname] = {"init_img": init_img, "fields": fields, "override_settings_component": override_settings_component}
 
     # backwards compatibility for existing extensions
     import modules.ui
@@ -72,38 +83,69 @@ def add_paste_fields(tabname, init_img, fields):
         modules.ui.img2img_paste_fields = fields
 
 
-def integrate_settings_paste_fields(component_dict):
-    from modules import ui
-
-    settings_map = {
-        'sd_hypernetwork': 'Hypernet',
-        'sd_hypernetwork_strength': 'Hypernet strength',
-        'CLIP_stop_at_last_layers': 'Clip skip',
-        'inpainting_mask_weight': 'Conditional mask weight',
-        'sd_model_checkpoint': 'Model hash',
-        'eta_noise_seed_delta': 'ENSD',
-        'initial_noise_multiplier': 'Noise multiplier',
-    }
-    settings_paste_fields = [
-        (component_dict[k], lambda d, k=k, v=v: ui.apply_setting(k, d.get(v, None)))
-        for k, v in settings_map.items()
-    ]
-
-    for tabname, info in paste_fields.items():
-        if info["fields"] is not None:
-            info["fields"] += settings_paste_fields
-
-
 def create_buttons(tabs_list):
     buttons = {}
     for tab in tabs_list:
-        buttons[tab] = gr.Button(f"Send to {tab}", elem_id=f"{tab}_tab")
+        name = tab
+        if name == 'txt2img':
+            name = 'text'
+        elif name == 'img2img':
+            name = 'image'
+        elif name == 'extras':
+            name = 'process'
+        buttons[tab] = gr.Button(f"➠ {name}", elem_id=f"{tab}_tab")
     return buttons
 
 
-#if send_generate_info is a tab name, mean generate_info comes from the params fields of the tab
 def bind_buttons(buttons, send_image, send_generate_info):
-    bind_list.append([buttons, send_image, send_generate_info])
+    """old function for backwards compatibility; do not use this, use register_paste_params_button"""
+    for tabname, button in buttons.items():
+        source_text_component = send_generate_info if isinstance(send_generate_info, gr.components.Component) else None
+        source_tabname = send_generate_info if isinstance(send_generate_info, str) else None
+        register_paste_params_button(ParamBinding(paste_button=button, tabname=tabname, source_text_component=source_text_component, source_image_component=send_image, source_tabname=source_tabname))
+
+
+def register_paste_params_button(binding: ParamBinding):
+    registered_param_bindings.append(binding)
+
+
+def connect_paste_params_buttons():
+    binding: ParamBinding
+    for binding in registered_param_bindings:
+        destination_image_component = paste_fields[binding.tabname]["init_img"]
+        fields = paste_fields[binding.tabname]["fields"]
+        override_settings_component = binding.override_settings_component or paste_fields[binding.tabname]["override_settings_component"]
+        destination_width_component = next(iter([field for field, name in fields if name == "Size-1"] if fields else []), None)
+        destination_height_component = next(iter([field for field, name in fields if name == "Size-2"] if fields else []), None)
+
+        if binding.source_image_component and destination_image_component:
+            if isinstance(binding.source_image_component, gr.Gallery):
+                func = send_image_and_dimensions if destination_width_component else image_from_url_text
+                jsfunc = "extract_image_from_gallery"
+            else:
+                func = send_image_and_dimensions if destination_width_component else lambda x: x
+                jsfunc = None
+            binding.paste_button.click(
+                fn=func,
+                _js=jsfunc,
+                inputs=[binding.source_image_component],
+                outputs=[destination_image_component, destination_width_component, destination_height_component] if destination_width_component else [destination_image_component],
+            )
+        if binding.source_text_component is not None and fields is not None:
+            connect_paste(binding.paste_button, fields, binding.source_text_component, override_settings_component, binding.tabname)
+        if binding.source_tabname is not None and fields is not None:
+            paste_field_names = ['Prompt', 'Negative prompt', 'Steps', 'Face restoration'] + (["Seed"] if shared.opts.send_seed else []) + binding.paste_field_names
+            binding.paste_button.click(
+                fn=lambda *x: x,
+                inputs=[field for field, name in paste_fields[binding.source_tabname]["fields"] if name in paste_field_names],
+                outputs=[field for field, name in fields if name in paste_field_names],
+            )
+        binding.paste_button.click(
+            fn=None,
+            _js=f"switch_to_{binding.tabname}",
+            inputs=None,
+            outputs=None,
+        )
 
 
 def send_image_and_dimensions(x):
@@ -111,59 +153,14 @@ def send_image_and_dimensions(x):
         img = x
     else:
         img = image_from_url_text(x)
-
     if shared.opts.send_size and isinstance(img, Image.Image):
         w = img.width
         h = img.height
     else:
         w = gr.update()
         h = gr.update()
-
     return img, w, h
 
-
-def run_bind():
-    for buttons, source_image_component, send_generate_info in bind_list:
-        for tab in buttons:
-            button = buttons[tab]
-            destination_image_component = paste_fields[tab]["init_img"]
-            fields = paste_fields[tab]["fields"]
-
-            destination_width_component = next(iter([field for field, name in fields if name == "Size-1"] if fields else []), None)
-            destination_height_component = next(iter([field for field, name in fields if name == "Size-2"] if fields else []), None)
-
-            if source_image_component and destination_image_component:
-                if isinstance(source_image_component, gr.Gallery):
-                    func = send_image_and_dimensions if destination_width_component else image_from_url_text
-                    jsfunc = "extract_image_from_gallery"
-                else:
-                    func = send_image_and_dimensions if destination_width_component else lambda x: x
-                    jsfunc = None
-
-                button.click(
-                    fn=func,
-                    _js=jsfunc,
-                    inputs=[source_image_component],
-                    outputs=[destination_image_component, destination_width_component, destination_height_component] if destination_width_component else [destination_image_component],
-                )
-
-            if send_generate_info and fields is not None:
-                if send_generate_info in paste_fields:
-                    paste_field_names = ['Prompt', 'Negative prompt', 'Steps', 'Face restoration'] + (["Seed"] if shared.opts.send_seed else [])
-                    button.click(
-                        fn=lambda *x: x,
-                        inputs=[field for field, name in paste_fields[send_generate_info]["fields"] if name in paste_field_names],
-                        outputs=[field for field, name in fields if name in paste_field_names],
-                    )
-                else:
-                    connect_paste(button, fields, send_generate_info)
-
-            button.click(
-                fn=None,
-                _js=f"switch_to_{tab}",
-                inputs=None,
-                outputs=None,
-            )
 
 
 def find_hypernetwork_key(hypernet_name, hypernet_hash=None):
@@ -233,80 +230,138 @@ Steps: 20, Sampler: Euler a, CFG scale: 7, Seed: 965400086, Size: 512x512, Model
 
     returns a dict with field values
     """
-
     res = {}
-
     prompt = ""
     negative_prompt = ""
-
     done_with_prompt = False
-
     *lines, lastline = x.strip().split("\n")
-    if not re_params.match(lastline):
+    if len(re_param.findall(lastline)) < 3:
         lines.append(lastline)
         lastline = ''
-
-    for i, line in enumerate(lines):
+    for _i, line in enumerate(lines):
         line = line.strip()
         if line.startswith("Negative prompt:"):
             done_with_prompt = True
             line = line[16:].strip()
-
         if done_with_prompt:
             negative_prompt += ("" if negative_prompt == "" else "\n") + line
         else:
             prompt += ("" if prompt == "" else "\n") + line
-
     res["Prompt"] = prompt
     res["Negative prompt"] = negative_prompt
-
     for k, v in re_param.findall(lastline):
+        v = v[1:-1] if v[0] == '"' and v[-1] == '"' else v
         m = re_imagesize.match(v)
         if m is not None:
             res[k+"-1"] = m.group(1)
             res[k+"-2"] = m.group(2)
         else:
             res[k] = v
-
     # Missing CLIP skip means it was set to 1 (the default)
     if "Clip skip" not in res:
         res["Clip skip"] = "1"
-
-    if "Hypernet strength" not in res:
-        res["Hypernet strength"] = "1"
-
-    if "Hypernet" in res:
-        hypernet_name = res["Hypernet"]
-        hypernet_hash = res.get("Hypernet hash", None)
-        res["Hypernet"] = find_hypernetwork_key(hypernet_name, hypernet_hash)
-
+    hypernet = res.get("Hypernet", None)
+    if hypernet is not None:
+        res["Prompt"] += f"""<hypernet:{hypernet}:{res.get("Hypernet strength", "1.0")}>"""
     if "Hires resize-1" not in res:
         res["Hires resize-1"] = 0
         res["Hires resize-2"] = 0
+    # Infer additional override settings for token merging
+    token_merging_ratio = res.get("Token merging ratio", None)
+    token_merging_ratio_hr = res.get("Token merging ratio hr", None)
+    if token_merging_ratio is not None or token_merging_ratio_hr is not None:
+        res["Token merging"] = 'True'
+        if token_merging_ratio is None:
+            res["Token merging hr only"] = 'True'
+        else:
+            res["Token merging hr only"] = 'False'
+        if res.get("Token merging random", None) is None:
+            res["Token merging random"] = 'False'
+        if res.get("Token merging merge attention", None) is None:
+            res["Token merging merge attention"] = 'True'
+        if res.get("Token merging merge cross attention", None) is None:
+            res["Token merging merge cross attention"] = 'False'
+        if res.get("Token merging merge mlp", None) is None:
+            res["Token merging merge mlp"] = 'False'
+        if res.get("Token merging stride x", None) is None:
+            res["Token merging stride x"] = '2'
+        if res.get("Token merging stride y", None) is None:
+            res["Token merging stride y"] = '2'
 
     restore_old_hires_fix_params(res)
-
     return res
 
 
-def connect_paste(button, paste_fields, input_comp, jsfunc=None):
+settings_map = {}
+
+
+infotext_to_setting_name_mapping = [
+    ('Clip skip', 'CLIP_stop_at_last_layers', ),
+    ('Conditional mask weight', 'inpainting_mask_weight'),
+    ('Model hash', 'sd_model_checkpoint'),
+    ('ENSD', 'eta_noise_seed_delta'),
+    ('Noise multiplier', 'initial_noise_multiplier'),
+    ('Eta', 'eta_ancestral'),
+    ('Eta DDIM', 'eta_ddim'),
+    ('Discard penultimate sigma', 'always_discard_next_to_last_sigma'),
+    ('UniPC variant', 'uni_pc_variant'),
+    ('UniPC skip type', 'uni_pc_skip_type'),
+    ('UniPC order', 'uni_pc_order'),
+    ('UniPC lower order final', 'uni_pc_lower_order_final'),
+    ('Token merging', 'token_merging'),
+    ('Token merging ratio', 'token_merging_ratio'),
+    ('Token merging hr only', 'token_merging_hr_only'),
+    ('Token merging ratio hr', 'token_merging_ratio_hr'),
+    ('Token merging random', 'token_merging_random'),
+    ('Token merging merge attention', 'token_merging_merge_attention'),
+    ('Token merging merge cross attention', 'token_merging_merge_cross_attention'),
+    ('Token merging merge mlp', 'token_merging_merge_mlp'),
+    ('Token merging maximum downsampling', 'token_merging_maximum_downsampling'),
+    ('Token merging stride x', 'token_merging_stride_x'),
+    ('Token merging stride y', 'token_merging_stride_y')
+]
+
+
+def create_override_settings_dict(text_pairs):
+    """creates processing's override_settings parameters from gradio's multiselect
+    Example input:
+        ['Clip skip: 2', 'Model hash: e6e99610c4', 'ENSD: 31337']
+
+    Example output:
+        {'CLIP_stop_at_last_layers': 2, 'sd_model_checkpoint': 'e6e99610c4', 'eta_noise_seed_delta': 31337}
+    """
+    res = {}
+    params = {}
+    for pair in text_pairs:
+        k, v = pair.split(":", maxsplit=1)
+        params[k] = v.strip()
+    for param_name, setting_name in infotext_to_setting_name_mapping:
+        value = params.get(param_name, None)
+        if value is None:
+            continue
+        res[setting_name] = shared.opts.cast_value(setting_name, value)
+    return res
+
+
+def connect_paste(button, paste_fields, input_comp, override_settings_component, tabname): # pylint: disable=redefined-outer-name
     def paste_func(prompt):
+        if 'Negative prompt' not in prompt and 'Steps' not in prompt:
+            prompt = None
         if not prompt and not shared.cmd_opts.hide_ui_dir_config:
-            filename = os.path.join(script_path, "params.txt")
+            filename = os.path.join(data_path, "params.txt")
             if os.path.exists(filename):
                 with open(filename, "r", encoding="utf8") as file:
                     prompt = file.read()
-
+            else:
+                prompt = ''
         params = parse_generation_parameters(prompt)
         script_callbacks.infotext_pasted_callback(prompt, params)
         res = []
-
         for output, key in paste_fields:
             if callable(key):
                 v = key(params)
             else:
                 v = params.get(key, None)
-
             if v is None:
                 res.append(gr.update())
             elif isinstance(v, type_of_gr_update):
@@ -314,23 +369,41 @@ def connect_paste(button, paste_fields, input_comp, jsfunc=None):
             else:
                 try:
                     valtype = type(output.value)
-
                     if valtype == bool and v == "False":
                         val = False
                     else:
                         val = valtype(v)
-
                     res.append(gr.update(value=val))
                 except Exception:
                     res.append(gr.update())
-
         return res
+
+    if override_settings_component is not None:
+        def paste_settings(params):
+            vals = {}
+            for param_name, setting_name in infotext_to_setting_name_mapping:
+                v = params.get(param_name, None)
+                if v is None:
+                    continue
+                if setting_name == "sd_model_checkpoint" and shared.opts.disable_weights_auto_swap:
+                    continue
+                v = shared.opts.cast_value(setting_name, v)
+                current_value = getattr(shared.opts, setting_name, None)
+                if v == current_value:
+                    continue
+                vals[param_name] = v
+            vals_pairs = [f"{k}: {v}" for k, v in vals.items()]
+            return gr.Dropdown.update(value=vals_pairs, choices=vals_pairs, visible=len(vals_pairs) > 0)
+        paste_fields = paste_fields + [(override_settings_component, paste_settings)]
 
     button.click(
         fn=paste_func,
-        _js=jsfunc,
         inputs=[input_comp],
         outputs=[x[0] for x in paste_fields],
     )
-
-
+    button.click(
+        fn=None,
+        _js=f"recalculate_prompts_{tabname}",
+        inputs=[],
+        outputs=[],
+    )

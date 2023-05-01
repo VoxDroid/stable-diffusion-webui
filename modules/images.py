@@ -1,24 +1,20 @@
 import datetime
-import sys
-import traceback
-
-import pytz
 import io
-import math
-import os
-from collections import namedtuple
 import re
-
+import os
+import math
+import json
+import string
+import hashlib
+from collections import namedtuple
+import pytz
 import numpy as np
 import piexif
 import piexif.helper
-from PIL import Image, ImageFont, ImageDraw, PngImagePlugin
-from fonts.ttf import Roboto
-import string
-import json
+from PIL import Image, ImageFont, ImageDraw, PngImagePlugin, ExifTags
 
-from modules import sd_samplers, shared, script_callbacks
-from modules.shared import opts, cmd_opts
+from modules import sd_samplers, shared, script_callbacks, errors
+from modules.shared import opts, cmd_opts # pylint: disable=unused-import
 
 LANCZOS = (Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS)
 
@@ -36,6 +32,8 @@ def image_grid(imgs, batch_size=1, rows=None):
         else:
             rows = math.sqrt(len(imgs))
             rows = round(rows)
+    if rows > len(imgs):
+        rows = len(imgs)
 
     cols = math.ceil(len(imgs) / rows)
 
@@ -128,7 +126,7 @@ class GridAnnotation:
         self.size = None
 
 
-def draw_grid_annotations(im, width, height, hor_texts, ver_texts):
+def draw_grid_annotations(im, width, height, hor_texts, ver_texts, margin=0):
     def wrap(drawing, text, font, line_length):
         lines = ['']
         for word in text.split():
@@ -141,12 +139,12 @@ def draw_grid_annotations(im, width, height, hor_texts, ver_texts):
 
     def get_font(fontsize):
         try:
-            return ImageFont.truetype(opts.font or Roboto, fontsize)
+            return ImageFont.truetype(opts.font or 'javascript/roboto.ttf', fontsize)
         except Exception:
-            return ImageFont.truetype(Roboto, fontsize)
+            return ImageFont.truetype('javascript/roboto.ttf', fontsize)
 
     def draw_texts(drawing, draw_x, draw_y, lines, initial_fnt, initial_fontsize):
-        for i, line in enumerate(lines):
+        for _i, line in enumerate(lines):
             fnt = initial_fnt
             fontsize = initial_fontsize
             while drawing.multiline_textsize(line.text, font=fnt)[0] > line.allowed_width and fontsize > 0:
@@ -192,32 +190,35 @@ def draw_grid_annotations(im, width, height, hor_texts, ver_texts):
             line.allowed_width = allowed_width
 
     hor_text_heights = [sum([line.size[1] + line_spacing for line in lines]) - line_spacing for lines in hor_texts]
-    ver_text_heights = [sum([line.size[1] + line_spacing for line in lines]) - line_spacing * len(lines) for lines in
-                        ver_texts]
+    ver_text_heights = [sum([line.size[1] + line_spacing for line in lines]) - line_spacing * len(lines) for lines in ver_texts]
 
-    pad_top = max(hor_text_heights) + line_spacing * 2
+    pad_top = 0 if sum(hor_text_heights) == 0 else max(hor_text_heights) + line_spacing * 2
 
-    result = Image.new("RGB", (im.width + pad_left, im.height + pad_top), "white")
-    result.paste(im, (pad_left, pad_top))
+    result = Image.new("RGB", (im.width + pad_left + margin * (cols-1), im.height + pad_top + margin * (rows-1)), "white")
+
+    for row in range(rows):
+        for col in range(cols):
+            cell = im.crop((width * col, height * row, width * (col+1), height * (row+1)))
+            result.paste(cell, (pad_left + (width + margin) * col, pad_top + (height + margin) * row))
 
     d = ImageDraw.Draw(result)
 
     for col in range(cols):
-        x = pad_left + width * col + width / 2
+        x = pad_left + (width + margin) * col + width / 2
         y = pad_top / 2 - hor_text_heights[col] / 2
 
         draw_texts(d, x, y, hor_texts[col], fnt, fontsize)
 
     for row in range(rows):
         x = pad_left / 2
-        y = pad_top + height * row + height / 2 - ver_text_heights[row] / 2
+        y = pad_top + (height + margin) * row + height / 2 - ver_text_heights[row] / 2
 
         draw_texts(d, x, y, ver_texts[row], fnt, fontsize)
 
     return result
 
 
-def draw_prompt_matrix(im, width, height, all_prompts):
+def draw_prompt_matrix(im, width, height, all_prompts, margin=0):
     prompts = all_prompts[1:]
     boundary = math.ceil(len(prompts) / 2)
 
@@ -227,7 +228,7 @@ def draw_prompt_matrix(im, width, height, all_prompts):
     hor_texts = [[GridAnnotation(x, is_active=pos & (1 << i) != 0) for i, x in enumerate(prompts_horiz)] for pos in range(1 << len(prompts_horiz))]
     ver_texts = [[GridAnnotation(x, is_active=pos & (1 << i) != 0) for i, x in enumerate(prompts_vert)] for pos in range(1 << len(prompts_vert))]
 
-    return draw_grid_annotations(im, width, height, hor_texts, ver_texts)
+    return draw_grid_annotations(im, width, height, hor_texts, ver_texts, margin)
 
 
 def resize_image(resize_mode, im, width, height, upscaler_name=None):
@@ -255,9 +256,12 @@ def resize_image(resize_mode, im, width, height, upscaler_name=None):
 
         if scale > 1.0:
             upscalers = [x for x in shared.sd_upscalers if x.name == upscaler_name]
-            assert len(upscalers) > 0, f"could not find upscaler named {upscaler_name}"
+            if len(upscalers) == 0:
+                upscaler = shared.sd_upscalers[0]
+                print(f"could not find upscaler named {upscaler_name or '<empty string>'}, using {upscaler.name} as a fallback")
+            else:
+                upscaler = upscalers[0]
 
-            upscaler = upscalers[0]
             im = upscaler.scaler.upscale(im, scale, upscaler.data_path)
 
         if im.width != w or im.height != h:
@@ -314,10 +318,9 @@ max_filename_part_length = 128
 def sanitize_filename_part(text, replace_spaces=True):
     if text is None:
         return None
-
+    text = os.path.basename(text)
     if replace_spaces:
         text = text.replace(' ', '_')
-
     text = text.translate({ord(x): '_' for x in invalid_filename_chars})
     text = text.lstrip(invalid_filename_prefix)[:max_filename_part_length]
     text = text.rstrip(invalid_filename_postfix)
@@ -335,9 +338,11 @@ class FilenameGenerator:
         'sampler': lambda self: self.p and sanitize_filename_part(self.p.sampler_name, replace_spaces=False),
         'model_hash': lambda self: getattr(self.p, "sd_model_hash", shared.sd_model.sd_model_hash),
         'model_name': lambda self: sanitize_filename_part(shared.sd_model.sd_checkpoint_info.model_name, replace_spaces=False),
+        'model_shortname': lambda self: sanitize_filename_part(shared.sd_model.sd_checkpoint_info.name_for_extra, replace_spaces=False),
         'date': lambda self: datetime.datetime.now().strftime('%Y-%m-%d'),
         'datetime': lambda self, *args: self.datetime(*args),  # accepts formats: [datetime], [datetime<Format>], [datetime<Format><Time Zone>]
         'job_timestamp': lambda self: getattr(self.p, "job_timestamp", shared.state.job_timestamp),
+        'prompt_hash': lambda self: hashlib.sha256(self.prompt.encode()).hexdigest()[0:8],
         'prompt': lambda self: sanitize_filename_part(self.prompt),
         'prompt_no_styles': lambda self: self.prompt_no_style(),
         'prompt_spaces': lambda self: sanitize_filename_part(self.prompt, replace_spaces=False),
@@ -411,10 +416,9 @@ class FilenameGenerator:
             if fun is not None:
                 try:
                     replacement = fun(self, *pattern_args)
-                except Exception:
+                except Exception as e:
                     replacement = None
-                    print(f"Error adding [{pattern}] to filename", file=sys.stderr)
-                    print(traceback.format_exc(), file=sys.stderr)
+                    errors.display(e, 'filename pattern')
 
                 if replacement is not None:
                     res += str(replacement)
@@ -482,6 +486,9 @@ def save_image(image, path, basename, seed=None, prompt=None, extension='png', i
     """
     namegen = FilenameGenerator(p, seed, prompt, image)
 
+    if path is None: # set default path to avoid errors when functions are triggered manually or via api and param is not set
+        path = opts.outdir_save
+
     if save_to_dirs is None:
         save_to_dirs = (grid and opts.grid_save_to_dirs) or (not grid and opts.save_to_dirs and not no_prompt)
 
@@ -546,8 +553,10 @@ def save_image(image, path, basename, seed=None, prompt=None, extension='png', i
         elif extension.lower() in (".jpg", ".jpeg", ".webp"):
             if image_to_save.mode == 'RGBA':
                 image_to_save = image_to_save.convert("RGB")
+            elif image_to_save.mode == 'I;16':
+                image_to_save = image_to_save.point(lambda p: p * 0.0038910505836576).convert("RGB" if extension.lower() == ".webp" else "L")
 
-            image_to_save.save(temp_file_path, format=image_format, quality=opts.jpeg_quality)
+            image_to_save.save(temp_file_path, format=image_format, quality=opts.jpeg_quality, lossless=opts.webp_lossless)
 
             if opts.enable_pnginfo and info is not None:
                 exif_bytes = piexif.dump({
@@ -564,21 +573,14 @@ def save_image(image, path, basename, seed=None, prompt=None, extension='png', i
         os.replace(temp_file_path, filename_without_extension + extension)
 
     fullfn_without_extension, extension = os.path.splitext(params.filename)
+    if hasattr(os, 'statvfs'):
+        max_name_len = os.statvfs(path).f_namemax
+        fullfn_without_extension = fullfn_without_extension[:max_name_len - max(4, len(extension))]
+        params.filename = fullfn_without_extension + extension
+        fullfn = params.filename
     _atomically_save_image(image, fullfn_without_extension, extension)
 
     image.already_saved_as = fullfn
-
-    target_side_length = 4000
-    oversize = image.width > target_side_length or image.height > target_side_length
-    if opts.export_for_4chan and (oversize or os.stat(fullfn).st_size > 4 * 1024 * 1024):
-        ratio = image.width / image.height
-
-        if oversize and ratio > 1:
-            image = image.resize((target_side_length, image.height * target_side_length // image.width), LANCZOS)
-        elif oversize:
-            image = image.resize((image.width * target_side_length // image.height, target_side_length), LANCZOS)
-
-        _atomically_save_image(image, fullfn_without_extension, ".jpg")
 
     if opts.save_txt and info is not None:
         txt_fullfn = f"{fullfn_without_extension}.txt"
@@ -591,43 +593,65 @@ def save_image(image, path, basename, seed=None, prompt=None, extension='png', i
 
     return fullfn, txt_fullfn
 
+def safe_decode_string(s: bytes):
+    remove_prefix = lambda text, prefix: text[len(prefix):] if text.startswith(prefix) else text
+    for encoding in ['utf-8', 'utf-16', 'ascii', 'latin_1', 'cp1252', 'cp437']: # try different encodings
+        try:
+            s = remove_prefix(s, b'UNICODE')
+            s = remove_prefix(s, b'ASCII')
+            s = remove_prefix(s, b'\x00')
+            val = s.decode(encoding, errors="strict")
+            val = re.sub(r'[\x00-\x09]', '', val).strip() # remove remaining special characters
+            if len(val) == 0: # remove empty strings
+                val = None
+            return val
+        except:
+            pass
+    return None
+
 
 def read_info_from_image(image):
     items = image.info or {}
-
     geninfo = items.pop('parameters', None)
 
     if "exif" in items:
         exif = piexif.load(items["exif"])
-        exif_comment = (exif or {}).get("Exif", {}).get(piexif.ExifIFD.UserComment, b'')
-        try:
-            exif_comment = piexif.helper.UserComment.load(exif_comment)
-        except ValueError:
-            exif_comment = exif_comment.decode('utf8', errors="ignore")
+        for _key, subkey in exif.items():
+            if isinstance(subkey, dict):
+                for key, val in subkey.items():
+                    if isinstance(val, bytes): # decode bytestring
+                        val = safe_decode_string(val)
+                    if isinstance(val, tuple) and isinstance(val[0], int) and isinstance(val[1], int): # convert camera ratios
+                        val = round(val[0] / val[1], 2)
+                    if val is not None and key in ExifTags.TAGS: # add known tags
+                        items[ExifTags.TAGS[key]] = val
+                        if ExifTags.TAGS[key] == 'UserComment': # add geninfo from UserComment
+                            geninfo = val
+                    elif val is not None and key in ExifTags.GPSTAGS:
+                        items[ExifTags.GPSTAGS[key]] = val
 
-        items['exif comment'] = exif_comment
-        geninfo = exif_comment
+    for key, val in items.items():
+        if isinstance(val, bytes): # decode bytestring
+            items[key] = safe_decode_string(val)
 
-        for field in ['jfif', 'jfif_version', 'jfif_unit', 'jfif_density', 'dpi', 'exif',
-                      'loop', 'background', 'timestamp', 'duration']:
-            items.pop(field, None)
+    for key in ['exif', 'ExifOffset', 'JpegIFOffset', 'JpegIFByteCount', 'ExifVersion', 'icc_profile', 'jfif', 'jfif_version', 'jfif_unit', 'jfif_density', 'adobe', 'photoshop', 'loop', 'duration', 'dpi']: # remove unwanted tags
+        items.pop(key, None)
 
     if items.get("Software", None) == "NovelAI":
         try:
             json_info = json.loads(items["Comment"])
             sampler = sd_samplers.samplers_map.get(json_info["sampler"], "Euler a")
-
             geninfo = f"""{items["Description"]}
 Negative prompt: {json_info["uc"]}
 Steps: {json_info["steps"]}, Sampler: {sampler}, CFG scale: {json_info["scale"]}, Seed: {json_info["seed"]}, Size: {image.width}x{image.height}, Clip skip: 2, ENSD: 31337"""
-        except Exception:
-            print("Error parsing NovelAI image generation parameters:", file=sys.stderr)
-            print(traceback.format_exc(), file=sys.stderr)
-
+        except Exception as e:
+            errors.display(e, 'novelai image parser')
     return geninfo, items
 
 
 def image_data(data):
+    import gradio as gr
+
     try:
         image = Image.open(io.BytesIO(data))
         textinfo, _ = read_info_from_image(image)
@@ -643,7 +667,7 @@ def image_data(data):
     except Exception:
         pass
 
-    return '', None
+    return gr.update(), None
 
 
 def flatten(img, bgcolor):

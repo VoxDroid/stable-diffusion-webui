@@ -1,18 +1,19 @@
+from types import MethodType
+from rich import print # pylint: disable=redefined-builtin
 import torch
 from torch.nn.functional import silu
-
-import modules.textual_inversion.textual_inversion
-from modules import devices, sd_hijack_optimizations, shared, sd_hijack_checkpoint
-from modules.hypernetworks import hypernetwork
-from modules.shared import cmd_opts
-from modules import sd_hijack_clip, sd_hijack_open_clip, sd_hijack_unet, sd_hijack_xlmr, xlmr
-
 import ldm.modules.attention
 import ldm.modules.diffusionmodules.model
 import ldm.modules.diffusionmodules.openaimodel
 import ldm.models.diffusion.ddim
 import ldm.models.diffusion.plms
 import ldm.modules.encoders.modules
+
+import modules.textual_inversion.textual_inversion
+from modules import devices, sd_hijack_optimizations, shared
+from modules.hypernetworks import hypernetwork
+from modules.shared import opts
+from modules import sd_hijack_clip, sd_hijack_open_clip, sd_hijack_unet, sd_hijack_xlmr, xlmr
 
 attention_CrossAttention_forward = ldm.modules.attention.CrossAttention.forward
 diffusionmodules_model_nonlinearity = ldm.modules.diffusionmodules.model.nonlinearity
@@ -30,35 +31,54 @@ ldm.modules.diffusionmodules.model.print = lambda *args: None
 
 def apply_optimizations():
     undo_optimizations()
-
     ldm.modules.diffusionmodules.model.nonlinearity = silu
     ldm.modules.diffusionmodules.openaimodel.th = sd_hijack_unet.th
-    
     optimization_method = None
+    can_use_sdp = hasattr(torch.nn.functional, "scaled_dot_product_attention") and callable(getattr(torch.nn.functional, "scaled_dot_product_attention"))
+    if devices.device == torch.device("cpu"):
+        if opts.cross_attention_optimization == "Scaled-Dot-Product":
+            print("Scaled dot product cross attention is not available on CPU")
+            can_use_sdp = False
+        if opts.cross_attention_optimization == "xFormers":
+            print("xFormers cross attention is not available on CPU")
+            shared.xformers_available = False
 
-    if cmd_opts.force_enable_xformers or (cmd_opts.xformers and shared.xformers_available and torch.version.cuda and (6, 0) <= torch.cuda.get_device_capability(shared.device) <= (9, 0)):
-        print("Applying xformers cross attention optimization.")
+    if opts.cross_attention_optimization == "Disable cross-attention layer optimization":
+        print("Cross-attention optimization disabled")
+        optimization_method = 'none'
+    if can_use_sdp and opts.cross_attention_optimization == "Scaled-Dot-Product" and 'SDP disable memory attention' in opts.cross_attention_options:
+        print("Applying scaled dot product cross attention optimization (without memory efficient attention)")
+        ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.scaled_dot_product_no_mem_attention_forward
+        ldm.modules.diffusionmodules.model.AttnBlock.forward = sd_hijack_optimizations.sdp_no_mem_attnblock_forward
+        optimization_method = 'sdp-no-mem'
+    elif can_use_sdp and opts.cross_attention_optimization == "Scaled-Dot-Product":
+        print("Applying scaled dot product cross attention optimization")
+        ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.scaled_dot_product_attention_forward
+        ldm.modules.diffusionmodules.model.AttnBlock.forward = sd_hijack_optimizations.sdp_attnblock_forward
+        optimization_method = 'sdp'
+    if shared.xformers_available and opts.cross_attention_optimization == "xFormers":
+        print("Applying xformers cross attention optimization")
         ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.xformers_attention_forward
         ldm.modules.diffusionmodules.model.AttnBlock.forward = sd_hijack_optimizations.xformers_attnblock_forward
         optimization_method = 'xformers'
-    elif cmd_opts.opt_sub_quad_attention:
-        print("Applying sub-quadratic cross attention optimization.")
+    if opts.cross_attention_optimization == "Sub-quadratic":
+        print("Applying sub-quadratic cross attention optimization")
         ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.sub_quad_attention_forward
         ldm.modules.diffusionmodules.model.AttnBlock.forward = sd_hijack_optimizations.sub_quad_attnblock_forward
         optimization_method = 'sub-quadratic'
-    elif cmd_opts.opt_split_attention_v1:
-        print("Applying v1 cross attention optimization.")
+    if opts.cross_attention_optimization == "Split attention":
+        print("Applying split attention optimization")
         ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.split_cross_attention_forward_v1
-        optimization_method = 'V1'
-    elif not cmd_opts.disable_opt_split_attention and (cmd_opts.opt_split_attention_invokeai or not cmd_opts.opt_split_attention and not torch.cuda.is_available()):
-        print("Applying cross attention optimization (InvokeAI).")
+        optimization_method = 'v1'
+    if opts.cross_attention_optimization == "InvokeAI's":
+        print("Applying InvokeAI's cross attention optimization")
         ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.split_cross_attention_forward_invokeAI
-        optimization_method = 'InvokeAI'
-    elif not cmd_opts.disable_opt_split_attention and (cmd_opts.opt_split_attention or torch.cuda.is_available()):
+        optimization_method = 'invokeai'
+    if opts.cross_attention_optimization == "Doggettx's":
         print("Applying cross attention optimization (Doggettx).")
         ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.split_cross_attention_forward
         ldm.modules.diffusionmodules.model.AttnBlock.forward = sd_hijack_optimizations.cross_attention_attnblock_forward
-        optimization_method = 'Doggettx'
+        optimization_method = 'doggettx'
 
     return optimization_method
 
@@ -70,9 +90,57 @@ def undo_optimizations():
 
 
 def fix_checkpoint():
-    ldm.modules.attention.BasicTransformerBlock.forward = sd_hijack_checkpoint.BasicTransformerBlock_forward
-    ldm.modules.diffusionmodules.openaimodel.ResBlock.forward = sd_hijack_checkpoint.ResBlock_forward
-    ldm.modules.diffusionmodules.openaimodel.AttentionBlock.forward = sd_hijack_checkpoint.AttentionBlock_forward
+    """checkpoints are now added and removed in embedding/hypernet code, since torch doesn't want
+    checkpoints to be added when not training (there's a warning)"""
+    pass
+
+
+def weighted_loss(sd_model, pred, target, mean=True):
+    #Calculate the weight normally, but ignore the mean
+    loss = sd_model._old_get_loss(pred, target, mean=False)
+
+    #Check if we have weights available
+    weight = getattr(sd_model, '_custom_loss_weight', None)
+    if weight is not None:
+        loss *= weight
+
+    #Return the loss, as mean if specified
+    return loss.mean() if mean else loss
+
+def weighted_forward(sd_model, x, c, w, *args, **kwargs):
+    try:
+        #Temporarily append weights to a place accessible during loss calc
+        sd_model._custom_loss_weight = w
+
+        #Replace 'get_loss' with a weight-aware one. Otherwise we need to reimplement 'forward' completely
+        #Keep 'get_loss', but don't overwrite the previous old_get_loss if it's already set
+        if not hasattr(sd_model, '_old_get_loss'):
+            sd_model._old_get_loss = sd_model.get_loss
+        sd_model.get_loss = MethodType(weighted_loss, sd_model)
+
+        #Run the standard forward function, but with the patched 'get_loss'
+        return sd_model.forward(x, c, *args, **kwargs)
+    finally:
+        try:
+            #Delete temporary weights if appended
+            del sd_model._custom_loss_weight
+        except AttributeError:
+            pass
+
+        #If we have an old loss function, reset the loss function to the original one
+        if hasattr(sd_model, '_old_get_loss'):
+            sd_model.get_loss = sd_model._old_get_loss
+            del sd_model._old_get_loss
+
+def apply_weighted_forward(sd_model):
+    #Add new function 'weighted_forward' that can be called to calc weighted loss
+    sd_model.weighted_forward = MethodType(weighted_forward, sd_model)
+
+def undo_weighted_forward(sd_model):
+    try:
+        del sd_model.weighted_forward
+    except AttributeError:
+        pass
 
 
 class StableDiffusionModelHijack:
@@ -86,7 +154,7 @@ class StableDiffusionModelHijack:
     embedding_db = modules.textual_inversion.textual_inversion.EmbeddingDatabase()
 
     def __init__(self):
-        self.embedding_db.add_embedding_dir(cmd_opts.embeddings_dir)
+        self.embedding_db.add_embedding_dir(opts.embeddings_dir)
 
     def hijack(self, m):
         if type(m.cond_stage_model) == xlmr.BertSeriesModelWithTransformation:
@@ -103,11 +171,23 @@ class StableDiffusionModelHijack:
             m.cond_stage_model.model.token_embedding = EmbeddingsWithFixes(m.cond_stage_model.model.token_embedding, self)
             m.cond_stage_model = sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
 
+        apply_weighted_forward(m)
+        if m.cond_stage_key == "edit":
+            sd_hijack_unet.hijack_ddpm_edit()
+
+        if opts.cuda_compile and opts.cuda_compile_mode != 'none':
+            try:
+                import torch._dynamo as dynamo # pylint: disable=unused-import
+                torch._dynamo.config.verbose = True # pylint: disable=protected-access
+                torch.backends.cudnn.benchmark = True
+                m.model = torch.compile(m.model, mode="default", backend=opts.cuda_compile_mode, fullgraph=False, dynamic=False)
+                print("Model compile enabled:", opts.cuda_compile_mode)
+            except Exception as err:
+                print(f"Model compile not supported: {err}")
+
         self.optimization_method = apply_optimizations()
 
         self.clip = m.cond_stage_model
-        
-        fix_checkpoint()
 
         def flatten(el):
             flattened = [flatten(children) for children in el.children()]
@@ -120,7 +200,7 @@ class StableDiffusionModelHijack:
 
     def undo_hijack(self, m):
         if type(m.cond_stage_model) == xlmr.BertSeriesModelWithTransformation:
-            m.cond_stage_model = m.cond_stage_model.wrapped 
+            m.cond_stage_model = m.cond_stage_model.wrapped
 
         elif type(m.cond_stage_model) == sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords:
             m.cond_stage_model = m.cond_stage_model.wrapped
@@ -131,6 +211,9 @@ class StableDiffusionModelHijack:
         elif type(m.cond_stage_model) == sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords:
             m.cond_stage_model.wrapped.model.token_embedding = m.cond_stage_model.wrapped.model.token_embedding.wrapped
             m.cond_stage_model = m.cond_stage_model.wrapped
+
+        undo_optimizations()
+        undo_weighted_forward(m)
 
         self.apply_circular(False)
         self.layers = None
@@ -172,7 +255,7 @@ class EmbeddingsWithFixes(torch.nn.Module):
         vecs = []
         for fixes, tensor in zip(batch_fixes, inputs_embeds):
             for offset, embedding in fixes:
-                emb = embedding.vec
+                emb = devices.cond_cast_unet(embedding.vec)
                 emb_len = min(tensor.shape[0] - offset - 1, emb.shape[0])
                 tensor = torch.cat([tensor[0:offset + 1], emb[0:emb_len], tensor[offset + 1 + emb_len:]])
 

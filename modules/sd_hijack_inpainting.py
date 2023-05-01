@@ -1,8 +1,4 @@
-import os
 import torch
-
-from einops import repeat
-from omegaconf import ListConfig
 
 import ldm.models.diffusion.ddpm
 import ldm.models.diffusion.ddim
@@ -11,6 +7,7 @@ import ldm.models.diffusion.plms
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.ddim import DDIMSampler, noise_like
+from ldm.models.diffusion.sampling_util import norm_thresholding
 
 
 @torch.no_grad()
@@ -66,6 +63,7 @@ def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=F
         if quantize_denoised:
             pred_x0, _, *_ = self.model.first_stage_model.quantize(pred_x0)
         if dynamic_threshold is not None:
+            from ldm.models.diffusion.sampling_util import norm_thresholding
             pred_x0 = norm_thresholding(pred_x0, dynamic_threshold)
         # direction pointing to x_t
         dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
@@ -94,15 +92,6 @@ def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=F
     x_prev, pred_x0 = get_x_prev_and_pred_x0(e_t_prime, index)
 
     return x_prev, pred_x0, e_t
-
-
-def should_hijack_inpainting(checkpoint_info):
-    from modules import sd_models
-
-    ckpt_basename = os.path.basename(checkpoint_info.filename).lower()
-    cfg_basename = os.path.basename(sd_models.find_checkpoint_config(checkpoint_info)).lower()
-
-    return "inpainting" in ckpt_basename and not "inpainting" in cfg_basename
 
 
 def do_inpainting_hijack():

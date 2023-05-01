@@ -4,9 +4,8 @@ import shutil
 import importlib
 from urllib.parse import urlparse
 
-from basicsr.utils.download_util import load_file_from_url
 from modules import shared
-from modules.upscaler import Upscaler
+from modules.upscaler import Upscaler, UpscalerLanczos, UpscalerNearest, UpscalerNone
 from modules.paths import script_path, models_path
 
 
@@ -41,14 +40,17 @@ def load_models(model_path: str, model_url: str = None, command_path: str = None
 
         for place in places:
             if os.path.exists(place):
-                for file in glob.iglob(place + '**/**', recursive=True):
+                for file in glob.iglob(os.path.join(place, '**/**'), recursive=True):
                     full_path = file
                     if os.path.isdir(full_path):
+                        continue
+                    if os.path.islink(full_path) and not os.path.exists(full_path):
+                        print(f"Skipping broken symlink: {full_path}")
                         continue
                     if ext_blacklist is not None and any([full_path.endswith(x) for x in ext_blacklist]):
                         continue
                     if len(ext_filter) != 0:
-                        model_name, extension = os.path.splitext(file)
+                        _model_name, extension = os.path.splitext(file)
                         if extension not in ext_filter:
                             continue
                     if file not in output:
@@ -56,6 +58,7 @@ def load_models(model_path: str, model_url: str = None, command_path: str = None
 
         if model_url is not None and len(output) == 0:
             if download_name is not None:
+                from basicsr.utils.download_util import load_file_from_url
                 dl = load_file_from_url(model_url, model_path, True, download_name)
                 output.append(dl)
             else:
@@ -72,7 +75,7 @@ def friendly_name(file: str):
         file = urlparse(file).path
 
     file = os.path.basename(file)
-    model_name, extension = os.path.splitext(file)
+    model_name, _extension = os.path.splitext(file)
     return model_name
 
 
@@ -83,8 +86,8 @@ def cleanup_models():
     root_path = script_path
     src_path = models_path
     dest_path = os.path.join(models_path, "Stable-diffusion")
-    move_files(src_path, dest_path, ".ckpt")
-    move_files(src_path, dest_path, ".safetensors")
+    # move_files(src_path, dest_path, ".ckpt")
+    # move_files(src_path, dest_path, ".safetensors")
     src_path = os.path.join(root_path, "ESRGAN")
     dest_path = os.path.join(models_path, "ESRGAN")
     move_files(src_path, dest_path)
@@ -99,6 +102,9 @@ def cleanup_models():
     move_files(src_path, dest_path)
     src_path = os.path.join(root_path, "repositories/latent-diffusion/experiments/pretrained_models/")
     dest_path = os.path.join(models_path, "LDSR")
+    move_files(src_path, dest_path)
+    src_path = os.path.join(root_path, "ScuNET")
+    dest_path = os.path.join(models_path, "ScuNET")
     move_files(src_path, dest_path)
 
 
@@ -131,10 +137,8 @@ forbidden_upscaler_classes = set()
 
 def list_builtin_upscalers():
     load_upscalers()
-
     builtin_upscaler_classes.clear()
     builtin_upscaler_classes.extend(Upscaler.__subclasses__())
-
 
 def forbid_loaded_nonbuiltin_upscalers():
     for cls in Upscaler.__subclasses__():
@@ -166,4 +170,8 @@ def load_upscalers():
         scaler = cls(commandline_options.get(cmd_name, None))
         datas += scaler.scalers
 
-    shared.sd_upscalers = datas
+    shared.sd_upscalers = sorted(
+        datas,
+        # Special case for UpscalerNone keeps it at the beginning of the list.
+        key=lambda x: x.name.lower() if not isinstance(x.scaler, (UpscalerNone, UpscalerLanczos, UpscalerNearest)) else ""
+    )

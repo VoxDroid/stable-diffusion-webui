@@ -93,9 +93,6 @@ def get_learned_conditioning_prompt_schedules(prompts, steps):
         try:
             tree = schedule_parser.parse(prompt)
         except lark.exceptions.LarkError as e:
-            if 0:
-                import traceback
-                traceback.print_exc()
             return [[steps, prompt]]
         return [[t, at_step(t, tree)] for t in collect_steps(steps, tree)]
 
@@ -274,6 +271,7 @@ re_attention = re.compile(r"""
 :
 """, re.X)
 
+re_break = re.compile(r"\s*\bBREAK\b\s*", re.S)
 
 def parse_prompt_attention(text):
     """
@@ -339,7 +337,11 @@ def parse_prompt_attention(text):
         elif text == ']' and len(square_brackets) > 0:
             multiply_range(square_brackets.pop(), square_bracket_multiplier)
         else:
-            res.append([text, 1.0])
+            parts = re.split(re_break, text)
+            for i, part in enumerate(parts):
+                if i > 0:
+                    res.append(["BREAK", -1])
+                res.append([part, 1.0])
 
     for pos in round_brackets:
         multiply_range(pos, round_bracket_multiplier)

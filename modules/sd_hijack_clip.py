@@ -96,13 +96,18 @@ class FrozenCLIPEmbedderWithCustomWordsBase(torch.nn.Module):
         token_count = 0
         last_comma = -1
 
-        def next_chunk():
-            """puts current chunk into the list of results and produces the next one - empty"""
+        def next_chunk(is_last=False):
+            """puts current chunk into the list of results and produces the next one - empty;
+            if is_last is true, tokens <end-of-text> tokens at the end won't add to token_count"""
             nonlocal token_count
             nonlocal last_comma
             nonlocal chunk
 
-            token_count += len(chunk.tokens)
+            if is_last:
+                token_count += len(chunk.tokens)
+            else:
+                token_count += self.chunk_length
+
             to_add = self.chunk_length - len(chunk.tokens)
             if to_add > 0:
                 chunk.tokens += [self.id_end] * to_add
@@ -116,6 +121,10 @@ class FrozenCLIPEmbedderWithCustomWordsBase(torch.nn.Module):
             chunk = PromptChunk()
 
         for tokens, (text, weight) in zip(tokenized, parsed):
+            if text == 'BREAK' and weight == -1:
+                next_chunk()
+                continue
+
             position = 0
             while position < len(tokens):
                 token = tokens[position]
@@ -159,7 +168,7 @@ class FrozenCLIPEmbedderWithCustomWordsBase(torch.nn.Module):
                 position += embedding_length_in_tokens
 
         if len(chunk.tokens) > 0 or len(chunks) == 0:
-            next_chunk()
+            next_chunk(is_last=True)
 
         return chunks, token_count
 
@@ -196,11 +205,7 @@ class FrozenCLIPEmbedderWithCustomWordsBase(torch.nn.Module):
         is when you do prompt editing: "a picture of a [cat:dog:0.4] eating ice cream"
         """
 
-        if opts.use_old_emphasis_implementation:
-            import modules.sd_hijack_clip_old
-            return modules.sd_hijack_clip_old.forward_old(self, texts)
-
-        batch_chunks, token_count = self.process_texts(texts)
+        batch_chunks, _token_count = self.process_texts(texts)
 
         used_embeddings = {}
         chunk_count = max([len(x) for x in batch_chunks])
@@ -214,7 +219,7 @@ class FrozenCLIPEmbedderWithCustomWordsBase(torch.nn.Module):
             self.hijack.fixes = [x.fixes for x in batch_chunk]
 
             for fixes in self.hijack.fixes:
-                for position, embedding in fixes:
+                for _position, embedding in fixes:
                     used_embeddings[embedding.name] = embedding
 
             z = self.process_tokens(tokens, multipliers)
@@ -290,6 +295,8 @@ class FrozenCLIPEmbedderWithCustomWords(FrozenCLIPEmbedderWithCustomWordsBase):
         return tokenized
 
     def encode_with_transformers(self, tokens):
+        if opts.CLIP_stop_at_last_layers is None:
+            opts.CLIP_stop_at_last_layers = 1
         outputs = self.wrapped.transformer(input_ids=tokens, output_hidden_states=-opts.CLIP_stop_at_last_layers)
 
         if opts.CLIP_stop_at_last_layers > 1:
